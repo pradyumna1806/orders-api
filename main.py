@@ -13,7 +13,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -73,11 +73,11 @@ async def create_order(
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="Missing Idempotency-Key")
 
-    # Same key → same response
+    # Same key -> same response
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
 
-    # Accept ANY valid JSON body
+    # Accept any valid JSON body
     try:
         body = await request.json()
         if not isinstance(body, dict):
