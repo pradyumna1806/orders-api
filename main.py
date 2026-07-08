@@ -1,6 +1,5 @@
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from typing import Optional
 import uuid
 import time
@@ -8,10 +7,13 @@ import base64
 
 app = FastAPI()
 
-# Allow browser requests
+# -----------------------------
+# CORS
+# -----------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -23,46 +25,72 @@ WINDOW = 10  # seconds
 # -----------------------------
 # In-memory storage
 # -----------------------------
-
-orders_created = {}
 idempotency_store = {}
-
 rate_limits = {}
 
-
 # -----------------------------
-# Request model
+# Rate Limiter Middleware
 # -----------------------------
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
 
-class Order(BaseModel):
-    item: str
-    quantity: int
+    client = request.headers.get("X-Client-Id")
+
+    if client:
+        now = time.time()
+
+        history = rate_limits.get(client, [])
+
+        # Keep only requests within last WINDOW seconds
+        history = [t for t in history if now - t < WINDOW]
+
+        if len(history) >= RATE_LIMIT:
+            retry_after = max(1, int(WINDOW - (now - history[0])))
+
+            return Response(
+                content="Rate limit exceeded",
+                status_code=429,
+                headers={
+                    "Retry-After": str(retry_after)
+                },
+            )
+
+        history.append(now)
+        rate_limits[client] = history
+
+    response = await call_next(request)
+    return response
 
 
 # -----------------------------
 # POST /orders
 # -----------------------------
-
 @app.post("/orders", status_code=201)
-def create_order(
-    order: Order,
-    idempotency_key: str = Header(..., alias="Idempotency-Key")
+async def create_order(
+    request: Request,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="Missing Idempotency-Key")
 
-    # Already created?
+    # Same key → same response
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
 
-    order_id = str(uuid.uuid4())
+    # Accept ANY valid JSON body
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
 
     result = {
-        "id": order_id,
-        "item": order.item,
-        "quantity": order.quantity
+        "id": str(uuid.uuid4()),
+        **body,
     }
 
     idempotency_store[idempotency_key] = result
-    orders_created[order_id] = result
 
     return result
 
@@ -70,14 +98,25 @@ def create_order(
 # -----------------------------
 # GET /orders
 # -----------------------------
-
 @app.get("/orders")
 def list_orders(limit: int = 10, cursor: Optional[str] = None):
+
+    if limit < 1:
+        limit = 1
 
     start = 1
 
     if cursor:
-        start = int(base64.b64decode(cursor).decode())
+        try:
+            start = int(base64.b64decode(cursor.encode()).decode())
+        except Exception:
+            start = 1
+
+    if start > TOTAL_ORDERS:
+        return {
+            "items": [],
+            "next_cursor": None
+        }
 
     end = min(start + limit - 1, TOTAL_ORDERS)
 
@@ -85,8 +124,7 @@ def list_orders(limit: int = 10, cursor: Optional[str] = None):
 
     for i in range(start, end + 1):
         items.append({
-            "id": i,
-            "name": f"Order {i}"
+            "id": i
         })
 
     next_cursor = None
@@ -101,38 +139,10 @@ def list_orders(limit: int = 10, cursor: Optional[str] = None):
 
 
 # -----------------------------
-# Rate Limiter
+# Root endpoint
 # -----------------------------
-
-@app.middleware("http")
-async def rate_limit(request, call_next):
-
-    client = request.headers.get("X-Client-Id")
-
-    if client:
-
-        now = time.time()
-
-        history = rate_limits.get(client, [])
-
-        history = [t for t in history if now - t < WINDOW]
-
-        if len(history) >= RATE_LIMIT:
-            retry = int(WINDOW - (now - history[0]))
-            if retry < 1:
-                retry = 1
-
-            return Response(
-                status_code=429,
-                headers={
-                    "Retry-After": str(retry)
-                }
-            )
-
-        history.append(now)
-
-        rate_limits[client] = history
-
-    response = await call_next(request)
-
-    return response
+@app.get("/")
+def root():
+    return {
+        "message": "Orders API is running"
+    }
